@@ -17,14 +17,14 @@ TEN_DAY_TRO = "DÃY TRỌ VŨ ĐỨC BÌNH"
 TRANG_THAI = ["Chưa thanh toán", "Đã thanh toán"]
 GIA_PHONG_MAC_DINH = 3_000_000
 CAI_DAT_MAC_DINH = {
-    "gia_dien": 3000,
+    "gia_dien": 3500,
     "gia_nuoc": 15000,
-    "phi_khac": 100000,
-    "so_phong": 50,
+    "phi_khac": 150000,
+    "so_phong": 10,
 }
 
 st.set_page_config(
-    page_title="Quản lý tiền phòng trọ", page_icon="🏠",
+    page_title="Quản lý tiền phòng trọ",
     layout="wide",
 )
 
@@ -165,6 +165,18 @@ def ensure_records(nam, thang, so_phong):
                 values,
             )
         conn.commit()
+
+
+def cap_nhat_gia_phong_tat_ca(nam, thang, so_phong, gia_moi):
+    """Cập nhật giá phòng của tất cả phòng trong tháng được chọn."""
+    with closing(get_conn()) as conn:
+        cursor = conn.execute(
+            "UPDATE records SET gia_phong = ? WHERE nam = ? AND thang = ? AND phong <= ?",
+            (int(gia_moi), int(nam), int(thang), int(so_phong)),
+        )
+        so_dong = cursor.rowcount
+        conn.commit()
+    return so_dong
 
 
 def get_record(nam, thang, phong):
@@ -469,6 +481,31 @@ if prices != prices_db:
 
 # Đảm bảo dữ liệu các phòng của tháng đang chọn đã tồn tại trong database
 ensure_records(nam_chon, idx_thang_chon, so_phong)
+
+# ---------- CẬP NHẬT GIÁ PHÒNG HÀNG LOẠT ----------
+with st.expander("🛠️ Cập nhật giá phòng hàng loạt", expanded=False):
+    st.warning(
+        f"Thao tác này sẽ đổi giá phòng của tất cả {so_phong} phòng trong {thang_chon} "
+        "thành 3.000.000 VNĐ, ghi đè giá phòng hiện tại của tháng này. "
+        "Dữ liệu các tháng khác không bị thay đổi."
+    )
+    xac_nhan_gia = st.checkbox(
+        f"Tôi xác nhận ghi đè giá phòng của tất cả phòng trong {thang_chon} thành 3.000.000 VNĐ",
+        key=f"xac_nhan_gia_hang_loat_{suffix}",
+    )
+    if st.button(
+        f"Cập nhật tất cả phòng thành 3.000.000 VNĐ - {thang_chon}",
+        type="primary",
+        disabled=not xac_nhan_gia,
+        key=f"cap_nhat_gia_hang_loat_{suffix}",
+    ):
+        so_dong = cap_nhat_gia_phong_tat_ca(
+            nam_chon, idx_thang_chon, so_phong, GIA_PHONG_MAC_DINH
+        )
+        st.success(
+            f"Đã cập nhật giá phòng thành 3.000.000 VNĐ cho {so_dong} phòng của {thang_chon}."
+        )
+        st.rerun()
 
 # ---------- NHẬP DỮ LIỆU ----------
 st.header(f"Nhập số liệu - {thang_chon}")
