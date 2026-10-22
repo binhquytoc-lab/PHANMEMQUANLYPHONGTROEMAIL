@@ -17,10 +17,10 @@ TEN_DAY_TRO = "DÃY TRỌ VŨ ĐỨC BÌNH"
 TRANG_THAI = ["Chưa thanh toán", "Đã thanh toán"]
 GIA_PHONG_MAC_DINH = 2_500_000
 CAI_DAT_MAC_DINH = {
-    "gia_dien": 3500,
+    "gia_dien": 3000,
     "gia_nuoc": 15000,
-    "phi_khac": 150000,
-    "so_phong": 10,
+    "phi_khac": 100000,
+    "so_phong": 50,
 }
 
 st.set_page_config(
