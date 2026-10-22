@@ -1,4 +1,4 @@
-```python
+
 import os
 import sqlite3
 import smtplib
@@ -1169,4 +1169,4 @@ if ket_qua:
 
 else:
     st.info("Chưa có dữ liệu phòng nào cho tháng này.")
-```
+
