@@ -1,4 +1,4 @@
-
+```python
 import os
 import sqlite3
 import smtplib
@@ -404,8 +404,28 @@ def save_record(nam, thang, phong, d):
             ),
         )
 
-        conn.commit()
 
+        # CẬP NHẬT GIÁ PHÒNG TẤT CẢ CÁC THÁNG
+        # CHỈ THỰC HIỆN MỘT LẦN DUY NHẤT
+        migration_key = "da_cap_nhat_gia_phong_4000000"
+
+        da_cap_nhat = conn.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (migration_key,),
+        ).fetchone()
+
+        if da_cap_nhat is None:
+            conn.execute(
+                "UPDATE records SET gia_phong = ?",
+                (GIA_PHONG_MAC_DINH,),
+            )
+
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?)",
+                (migration_key, 1),
+            )
+
+        conn.commit()
 
 # ======================================
 # TÍNH TOÁN
@@ -1149,4 +1169,4 @@ if ket_qua:
 
 else:
     st.info("Chưa có dữ liệu phòng nào cho tháng này.")
-
+```
