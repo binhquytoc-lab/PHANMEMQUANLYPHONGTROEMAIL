@@ -1,5 +1,7 @@
 import os
 import sqlite3
+import smtplib
+from email.message import EmailMessage
 from contextlib import closing
 from datetime import datetime
 
@@ -61,6 +63,7 @@ def init_db():
                 gia_phong  INTEGER NOT NULL DEFAULT 0,
                 nguoi_o    TEXT    NOT NULL DEFAULT '',
                 sdt        TEXT    NOT NULL DEFAULT '',
+                email      TEXT    NOT NULL DEFAULT '',
                 so_nguoi   INTEGER NOT NULL DEFAULT 1,
                 dien_cu    INTEGER NOT NULL DEFAULT 0,
                 dien_moi   INTEGER NOT NULL DEFAULT 0,
@@ -71,6 +74,10 @@ def init_db():
             );
             """
         )
+        # Nâng cấp database cũ: thêm cột email nếu chưa tồn tại.
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(records)").fetchall()]
+        if "email" not in columns:
+            conn.execute("ALTER TABLE records ADD COLUMN email TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
 
@@ -145,16 +152,16 @@ def ensure_records(nam, thang, so_phong):
             if prev:
                 values = (
                     nam, thang, phong, prev["gia_phong"], prev["nguoi_o"], prev["sdt"],
-                    prev["so_nguoi"], prev["dien_moi"], prev["dien_moi"],
+                    prev["email"], prev["so_nguoi"], prev["dien_moi"], prev["dien_moi"],
                     prev["nuoc_moi"], prev["nuoc_moi"], TRANG_THAI[0],
                 )
             else:
                 values = (
-                    nam, thang, phong, GIA_PHONG_MAC_DINH, "", "", 1, 0, 0, 0, 0, TRANG_THAI[0],
+                    nam, thang, phong, GIA_PHONG_MAC_DINH, "", "", "", 1, 0, 0, 0, 0, TRANG_THAI[0],
                 )
             conn.execute(
-                "INSERT INTO records (nam, thang, phong, gia_phong, nguoi_o, sdt, so_nguoi, "
-                "dien_cu, dien_moi, nuoc_cu, nuoc_moi, trang_thai) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO records (nam, thang, phong, gia_phong, nguoi_o, sdt, email, so_nguoi, "
+                "dien_cu, dien_moi, nuoc_cu, nuoc_moi, trang_thai) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 values,
             )
         conn.commit()
@@ -181,11 +188,11 @@ def get_records(nam, thang, so_phong):
 def save_record(nam, thang, phong, d):
     with closing(get_conn()) as conn:
         conn.execute(
-            "UPDATE records SET gia_phong = ?, nguoi_o = ?, sdt = ?, so_nguoi = ?, "
+            "UPDATE records SET gia_phong = ?, nguoi_o = ?, sdt = ?, email = ?, "
             "dien_cu = ?, dien_moi = ?, nuoc_cu = ?, nuoc_moi = ?, trang_thai = ? "
             "WHERE nam = ? AND thang = ? AND phong = ?",
             (
-                d["gia_phong"], d["nguoi_o"], d["sdt"], d["so_nguoi"],
+                d["gia_phong"], d["nguoi_o"], d["sdt"], d["email"],
                 d["dien_cu"], d["dien_moi"], d["nuoc_cu"], d["nuoc_moi"], d["trang_thai"],
                 nam, thang, phong,
             ),
@@ -296,7 +303,7 @@ def tao_pdf(nam, thang, danh_sach):
             ("Phòng:", str(rec["phong"])),
             ("Người ở:", rec["nguoi_o"] or "-"),
             ("Điện thoại:", rec["sdt"] or "-"),
-            ("Số người ở:", str(rec["so_nguoi"])),
+            ("Email:", rec.get("email", "") or "-"),
         ]
         for nhan, gia_tri in thong_tin:
             pdf.set_font("VN", "B", 10)
@@ -358,6 +365,48 @@ def tao_pdf(nam, thang, danh_sach):
         pdf.cell(64, 5, "(Ký, ghi rõ họ tên)", align="C", new_x="LMARGIN", new_y="NEXT")
 
     return bytes(pdf.output())
+
+
+# ======================================
+# GỬI EMAIL KÈM PHIẾU THU PDF
+# ======================================
+def gui_email_hoa_don(email_nhan, nam, thang, phong, rec, kq, prices, pdf_bytes):
+    """Gửi hóa đơn PDF qua Gmail SMTP SSL, dùng thông tin trong st.secrets."""
+    if not email_nhan or "@" not in email_nhan:
+        raise ValueError("Vui lòng nhập địa chỉ email người thuê hợp lệ và lưu thông tin phòng trước.")
+    try:
+        gmail_cfg = st.secrets["gmail"]
+        email_gui = str(gmail_cfg["address"]).strip()
+        app_password = str(gmail_cfg["app_password"]).replace(" ", "").strip()
+    except Exception as exc:
+        raise RuntimeError(
+            'Chưa cấu hình Secrets. Hãy thêm [gmail] với address và app_password trong mục Settings → Secrets.'
+        ) from exc
+
+    if not email_gui or not app_password:
+        raise RuntimeError("Secrets [gmail] đang thiếu address hoặc app_password.")
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Phiếu thu tiền phòng {phong} - Tháng {thang}/{nam}"
+    msg["From"] = email_gui
+    msg["To"] = email_nhan
+    ten = rec.get("nguoi_o", "").strip() or "Quý khách"
+    msg.set_content(
+        f"Kính gửi {ten},\n\n"
+        f"Dãy trọ {TEN_DAY_TRO} gửi Quý khách phiếu thu tiền phòng tháng {thang}/{nam}.\n"
+        f"Phòng: {phong}\n"
+        f"Tổng tiền: {tien(kq['tong'])} VNĐ\n"
+        f"Trạng thái thanh toán: {rec['trang_thai']}\n\n"
+        "Vui lòng xem chi tiết trong file PDF đính kèm. Nếu đã thanh toán, Quý khách có thể bỏ qua thông báo này.\n\n"
+        f"Trân trọng,\n{TEN_DAY_TRO}"
+    )
+    msg.add_attachment(
+        pdf_bytes, maintype="application", subtype="pdf",
+        filename=f"Phieu_Phong_{phong}_{thang:02d}_{nam}.pdf"
+    )
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+        server.login(email_gui, app_password)
+        server.send_message(msg)
 
 
 # ======================================
@@ -434,8 +483,8 @@ rec = get_record(nam_chon, idx_thang_chon, phong)
 st.subheader(f"Cập nhật: Phòng {phong} ({thang_chon})")
 
 with st.form(key=f"form_{suffix}_{phong}"):
-    # Hàng 1: Giá phòng + thông tin người ở
-    a1, a2, a3, a4 = st.columns([1.2, 1.6, 1.2, 0.8])
+    # Hàng 1: Giá phòng + thông tin người ở và email
+    a1, a2, a3, a4 = st.columns([1.2, 1.5, 1.2, 1.6])
     with a1:
         gia_phong = st.number_input(
             "Giá phòng (VNĐ)", min_value=0, value=int(rec["gia_phong"]), step=50000
@@ -445,9 +494,7 @@ with st.form(key=f"form_{suffix}_{phong}"):
     with a3:
         sdt = st.text_input("Số điện thoại", value=rec["sdt"])
     with a4:
-        so_nguoi = st.number_input(
-            "Số người ở", min_value=0, max_value=20, value=int(rec["so_nguoi"]), step=1
-        )
+        email = st.text_input("Địa chỉ email người thuê", value=rec.get("email", ""), placeholder="khachhang@gmail.com")
 
     # Hàng 2: điện nước
     b1, b2, b3, b4 = st.columns(4)
@@ -475,7 +522,7 @@ if submitted:
         nam_chon, idx_thang_chon, phong,
         {
             "gia_phong": gia_phong, "nguoi_o": nguoi_o.strip(), "sdt": sdt.strip(),
-            "so_nguoi": so_nguoi, "dien_cu": dien_cu, "dien_moi": dien_moi,
+            "email": email.strip(), "dien_cu": dien_cu, "dien_moi": dien_moi,
             "nuoc_cu": nuoc_cu, "nuoc_moi": nuoc_moi, "trang_thai": trang_thai,
         },
     )
@@ -497,6 +544,31 @@ try:
 except FileNotFoundError as e:
     st.warning(str(e))
 
+# ---------- GỬI EMAIL CHO PHÒNG ĐANG CHỌN ----------
+st.divider()
+st.subheader(f"📧 Gửi phiếu thu qua email - Phòng {phong}")
+email_hien_tai = rec.get("email", "")
+if not email_hien_tai:
+    st.warning("Phòng này chưa có địa chỉ email. Nhập email ở phần cập nhật và bấm Lưu thông tin phòng trước khi gửi.")
+else:
+    st.caption(f"Email người nhận: {email_hien_tai}")
+    st.caption("Email sẽ đính kèm phiếu thu PDF của phòng đang chọn, đúng tháng/năm hiện tại.")
+if st.button(f"📨 Gửi email hóa đơn Phòng {phong}", type="primary", key=f"send_email_{suffix}_{phong}"):
+    if not email_hien_tai:
+        st.error("Chưa có email người nhận. Vui lòng nhập email và lưu thông tin phòng trước.")
+    else:
+        try:
+            # Tạo PDF riêng cho phòng đang chọn để đính kèm email.
+            pdf_gui = tao_pdf(nam_chon, idx_thang_chon, [(rec, tinh_tien(rec, prices), prices)])
+            gui_email_hoa_don(
+                email_hien_tai, nam_chon, idx_thang_chon, phong, rec,
+                tinh_tien(rec, prices), prices, pdf_gui
+            )
+            st.success(f"Đã gửi email hóa đơn Phòng {phong} đến {email_hien_tai}.")
+        except Exception as e:
+            st.error(f"Gửi email chưa thành công: {e}")
+            st.info("Kiểm tra Secrets, địa chỉ email nhận và Gmail App Password 16 ký tự. Không dùng mật khẩu đăng nhập Gmail thông thường.")
+
 # ---------- BẢNG TỔNG HỢP ----------
 st.divider()
 st.header(f"Bảng tổng hợp tiền trọ - {thang_chon}")
@@ -517,6 +589,7 @@ for r in records:
         "Phòng": f"Phòng {r['phong']}",
         "Người ở": r["nguoi_o"],
         "SĐT": r["sdt"],
+        "Email": r.get("email", ""),
         "Giá phòng": r["gia_phong"],
         "Số điện cũ": r["dien_cu"],
         "Số điện mới": r["dien_moi"],
