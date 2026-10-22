@@ -1,453 +1,590 @@
-import streamlit as st
-import pandas as pd
-import sqlite3
-from datetime import datetime
-from io import BytesIO
-from xml.sax.saxutils import escape
-
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 import os
+import sqlite3
+from contextlib import closing
+from datetime import datetime
+
+import pandas as pd
+import streamlit as st
+from fpdf import FPDF
 
 # ======================================
-# CẤU HÌNH TRANG
+# CẤU HÌNH CHUNG
 # ======================================
+DB_PATH = "tien_tro.db"
+TEN_DAY_TRO = "DÃY TRỌ VŨ ĐỨC BÌNH"
+TRANG_THAI = ["Chưa thanh toán", "Đã thanh toán"]
+GIA_PHONG_MAC_DINH = 2_500_000
+CAI_DAT_MAC_DINH = {
+    "gia_dien": 3500,
+    "gia_nuoc": 15000,
+    "phi_khac": 150000,
+    "so_phong": 10,
+}
+
 st.set_page_config(
     page_title="Quản lý tiền phòng trọ",
-    page_icon="🏠",
-    layout="wide"
+    layout="wide",
 )
-st.title("🏠 PHẦN MỀM QUẢN LÝ THU TIỀN DÃY TRỌ_VŨ ĐỨC BÌNH")
-
-DB_FILE = "quan_ly_tien_tro.db"
-
-# Tự tìm font Unicode để PDF hiển thị tiếng Việt có dấu.
-PDF_FONT = "Helvetica"
-PDF_FONT_BOLD = "Helvetica-Bold"
-FONT_CANDIDATES = [
-    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
-    ("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf", "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"),
-    (r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\arialbd.ttf"),
-]
-for regular_path, bold_path in FONT_CANDIDATES:
-    if os.path.exists(regular_path) and os.path.exists(bold_path):
-        try:
-            pdfmetrics.registerFont(TTFont("VietnameseFont", regular_path))
-            pdfmetrics.registerFont(TTFont("VietnameseFont-Bold", bold_path))
-            PDF_FONT = "VietnameseFont"
-            PDF_FONT_BOLD = "VietnameseFont-Bold"
-            break
-        except Exception:
-            pass
 
 
 # ======================================
-# SQLITE DATABASE
+# DATABASE (SQLITE)
 # ======================================
-def get_connection():
-    conn = sqlite3.connect(DB_FILE, timeout=30)
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
-    with get_connection() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS room_bills (
-                year INTEGER NOT NULL,
-                month INTEGER NOT NULL,
-                room_no INTEGER NOT NULL,
-                room_price INTEGER NOT NULL DEFAULT 2500000,
-                tenant_name TEXT NOT NULL DEFAULT '',
-                tenant_phone TEXT NOT NULL DEFAULT '',
-                tenant_info TEXT NOT NULL DEFAULT '',
-                electric_old INTEGER NOT NULL DEFAULT 0,
-                electric_new INTEGER NOT NULL DEFAULT 0,
-                water_old INTEGER NOT NULL DEFAULT 0,
-                water_new INTEGER NOT NULL DEFAULT 0,
-                note TEXT NOT NULL DEFAULT 'Chưa thanh toán',
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (year, month, room_no)
-            )
-        """)
+    with closing(get_conn()) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS month_prices (
+                nam      INTEGER NOT NULL,
+                thang    INTEGER NOT NULL,
+                gia_dien INTEGER NOT NULL,
+                gia_nuoc INTEGER NOT NULL,
+                phi_khac INTEGER NOT NULL,
+                PRIMARY KEY (nam, thang)
+            );
+
+            CREATE TABLE IF NOT EXISTS records (
+                nam        INTEGER NOT NULL,
+                thang      INTEGER NOT NULL,
+                phong      INTEGER NOT NULL,
+                gia_phong  INTEGER NOT NULL DEFAULT 0,
+                nguoi_o    TEXT    NOT NULL DEFAULT '',
+                sdt        TEXT    NOT NULL DEFAULT '',
+                so_nguoi   INTEGER NOT NULL DEFAULT 1,
+                dien_cu    INTEGER NOT NULL DEFAULT 0,
+                dien_moi   INTEGER NOT NULL DEFAULT 0,
+                nuoc_cu    INTEGER NOT NULL DEFAULT 0,
+                nuoc_moi   INTEGER NOT NULL DEFAULT 0,
+                trang_thai TEXT    NOT NULL DEFAULT 'Chưa thanh toán',
+                PRIMARY KEY (nam, thang, phong)
+            );
+            """
+        )
         conn.commit()
 
 
-def load_bill(year, month, room_no):
-    with get_connection() as conn:
-        row = conn.execute("""
-            SELECT * FROM room_bills
-            WHERE year = ? AND month = ? AND room_no = ?
-        """, (year, month, room_no)).fetchone()
-    if row:
-        return dict(row)
+def get_setting(key):
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return int(row["value"]) if row else CAI_DAT_MAC_DINH[key]
+
+
+def set_setting(key, value):
+    with closing(get_conn()) as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, int(value)),
+        )
+        conn.commit()
+
+
+def get_month_prices(nam, thang):
+    """Đơn giá của từng tháng. Tháng mới sẽ kế thừa đơn giá của tháng gần nhất trước đó."""
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT gia_dien, gia_nuoc, phi_khac FROM month_prices WHERE nam = ? AND thang = ?",
+            (nam, thang),
+        ).fetchone()
+        if row:
+            return dict(row)
+
+        row = conn.execute(
+            "SELECT gia_dien, gia_nuoc, phi_khac FROM month_prices "
+            "WHERE (nam * 100 + thang) < ? ORDER BY (nam * 100 + thang) DESC LIMIT 1",
+            (nam * 100 + thang,),
+        ).fetchone()
+        prices = dict(row) if row else {
+            k: CAI_DAT_MAC_DINH[k] for k in ("gia_dien", "gia_nuoc", "phi_khac")
+        }
+        conn.execute(
+            "INSERT INTO month_prices (nam, thang, gia_dien, gia_nuoc, phi_khac) VALUES (?, ?, ?, ?, ?)",
+            (nam, thang, prices["gia_dien"], prices["gia_nuoc"], prices["phi_khac"]),
+        )
+        conn.commit()
+    return prices
+
+
+def save_month_prices(nam, thang, gia_dien, gia_nuoc, phi_khac):
+    with closing(get_conn()) as conn:
+        conn.execute(
+            "UPDATE month_prices SET gia_dien = ?, gia_nuoc = ?, phi_khac = ? WHERE nam = ? AND thang = ?",
+            (gia_dien, gia_nuoc, phi_khac, nam, thang),
+        )
+        conn.commit()
+
+
+def ensure_records(nam, thang, so_phong):
+    """Tạo dữ liệu cho các phòng còn thiếu, kế thừa từ lần ghi gần nhất của phòng đó."""
+    with closing(get_conn()) as conn:
+        for phong in range(1, so_phong + 1):
+            exists = conn.execute(
+                "SELECT 1 FROM records WHERE nam = ? AND thang = ? AND phong = ?",
+                (nam, thang, phong),
+            ).fetchone()
+            if exists:
+                continue
+
+            prev = conn.execute(
+                "SELECT * FROM records WHERE phong = ? AND (nam * 100 + thang) < ? "
+                "ORDER BY (nam * 100 + thang) DESC LIMIT 1",
+                (phong, nam * 100 + thang),
+            ).fetchone()
+
+            if prev:
+                values = (
+                    nam, thang, phong, prev["gia_phong"], prev["nguoi_o"], prev["sdt"],
+                    prev["so_nguoi"], prev["dien_moi"], prev["dien_moi"],
+                    prev["nuoc_moi"], prev["nuoc_moi"], TRANG_THAI[0],
+                )
+            else:
+                values = (
+                    nam, thang, phong, GIA_PHONG_MAC_DINH, "", "", 1, 0, 0, 0, 0, TRANG_THAI[0],
+                )
+            conn.execute(
+                "INSERT INTO records (nam, thang, phong, gia_phong, nguoi_o, sdt, so_nguoi, "
+                "dien_cu, dien_moi, nuoc_cu, nuoc_moi, trang_thai) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                values,
+            )
+        conn.commit()
+
+
+def get_record(nam, thang, phong):
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT * FROM records WHERE nam = ? AND thang = ? AND phong = ?",
+            (nam, thang, phong),
+        ).fetchone()
+    return dict(row)
+
+
+def get_records(nam, thang, so_phong):
+    with closing(get_conn()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM records WHERE nam = ? AND thang = ? AND phong <= ? ORDER BY phong",
+            (nam, thang, so_phong),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_record(nam, thang, phong, d):
+    with closing(get_conn()) as conn:
+        conn.execute(
+            "UPDATE records SET gia_phong = ?, nguoi_o = ?, sdt = ?, so_nguoi = ?, "
+            "dien_cu = ?, dien_moi = ?, nuoc_cu = ?, nuoc_moi = ?, trang_thai = ? "
+            "WHERE nam = ? AND thang = ? AND phong = ?",
+            (
+                d["gia_phong"], d["nguoi_o"], d["sdt"], d["so_nguoi"],
+                d["dien_cu"], d["dien_moi"], d["nuoc_cu"], d["nuoc_moi"], d["trang_thai"],
+                nam, thang, phong,
+            ),
+        )
+        # Cập nhật số cũ cho tháng sau (nếu tháng sau đã có dữ liệu)
+        if thang == 12:
+            nam_sau, thang_sau = nam + 1, 1
+        else:
+            nam_sau, thang_sau = nam, thang + 1
+        conn.execute(
+            "UPDATE records SET dien_cu = ?, nuoc_cu = ? WHERE nam = ? AND thang = ? AND phong = ?",
+            (d["dien_moi"], d["nuoc_moi"], nam_sau, thang_sau, phong),
+        )
+        conn.commit()
+
+
+# ======================================
+# TÍNH TOÁN
+# ======================================
+def tinh_tien(rec, prices):
+    so_dien = max(rec["dien_moi"] - rec["dien_cu"], 0)
+    so_nuoc = max(rec["nuoc_moi"] - rec["nuoc_cu"], 0)
+    tien_dien = so_dien * prices["gia_dien"]
+    tien_nuoc = so_nuoc * prices["gia_nuoc"]
+    tong = rec["gia_phong"] + tien_dien + tien_nuoc + prices["phi_khac"]
+    return {
+        "so_dien": so_dien,
+        "so_nuoc": so_nuoc,
+        "tien_dien": tien_dien,
+        "tien_nuoc": tien_nuoc,
+        "phi_khac": prices["phi_khac"],
+        "tong": tong,
+    }
+
+
+def tien(x):
+    return f"{int(x):,}".replace(",", ".")
+
+
+# ======================================
+# XUẤT PDF
+# ======================================
+FONT_REGULAR = [
+    "fonts/DejaVuSans.ttf",
+    "fonts/Roboto-Regular.ttf",
+    "fonts/NotoSans-Regular.ttf",
+    "fonts/arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+]
+FONT_BOLD = [
+    "fonts/DejaVuSans-Bold.ttf",
+    "fonts/Roboto-Bold.ttf",
+    "fonts/NotoSans-Bold.ttf",
+    "fonts/arialbd.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+    "/Library/Fonts/Arial Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+]
+
+
+def tim_font(danh_sach):
+    for path in danh_sach:
+        if os.path.exists(path):
+            return path
     return None
 
 
-def save_bill(year, month, room_no, data):
-    with get_connection() as conn:
-        conn.execute("""
-            INSERT INTO room_bills (
-                year, month, room_no, room_price, tenant_name, tenant_phone,
-                tenant_info, electric_old, electric_new, water_old, water_new,
-                note, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(year, month, room_no) DO UPDATE SET
-                room_price=excluded.room_price,
-                tenant_name=excluded.tenant_name,
-                tenant_phone=excluded.tenant_phone,
-                tenant_info=excluded.tenant_info,
-                electric_old=excluded.electric_old,
-                electric_new=excluded.electric_new,
-                water_old=excluded.water_old,
-                water_new=excluded.water_new,
-                note=excluded.note,
-                updated_at=excluded.updated_at
-        """, (
-            year, month, room_no, data["gia_phong"], data["ten_nguoi_o"],
-            data["so_dien_thoai"], data["thong_tin_nguoi_o"],
-            data["dien_cu"], data["dien_moi"], data["nuoc_cu"],
-            data["nuoc_moi"], data["ghi_chu"], datetime.now().isoformat(timespec="seconds")
-        ))
-        conn.commit()
+def tao_pdf(nam, thang, danh_sach):
+    """danh_sach: list các (record, kết quả tính tiền, đơn giá). Mỗi phòng một trang."""
+    reg = tim_font(FONT_REGULAR)
+    if not reg:
+        raise FileNotFoundError(
+            "Không tìm thấy font hỗ trợ tiếng Việt. Hãy copy file DejaVuSans.ttf "
+            "(và DejaVuSans-Bold.ttf) vào thư mục 'fonts' cạnh file app.py."
+        )
+    bold = tim_font(FONT_BOLD) or reg
+
+    pdf = FPDF(orientation="P", unit="mm", format="A5")
+    pdf.set_auto_page_break(auto=False)
+    pdf.add_font("VN", "", reg)
+    pdf.add_font("VN", "B", bold)
+
+    w = [30, 64, 34]  # tổng 128mm (A5 trừ lề 10mm hai bên)
+
+    for rec, kq, prices in danh_sach:
+        pdf.add_page()
+        pdf.set_margins(10, 10, 10)
+        pdf.set_xy(10, 12)
+
+        pdf.set_font("VN", "B", 13)
+        pdf.cell(0, 7, TEN_DAY_TRO, align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("VN", "B", 16)
+        pdf.cell(0, 9, "PHIẾU THU TIỀN PHÒNG", align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("VN", "", 10)
+        pdf.cell(0, 6, f"Tháng {thang}/{nam}", align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(4)
+
+        # Thông tin phòng và người ở
+        thong_tin = [
+            ("Phòng:", str(rec["phong"])),
+            ("Người ở:", rec["nguoi_o"] or "-"),
+            ("Điện thoại:", rec["sdt"] or "-"),
+            ("Số người ở:", str(rec["so_nguoi"])),
+        ]
+        for nhan, gia_tri in thong_tin:
+            pdf.set_font("VN", "B", 10)
+            pdf.cell(30, 6, nhan)
+            pdf.set_font("VN", "", 10)
+            pdf.cell(0, 6, gia_tri, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+        # Bảng chi tiết
+        pdf.set_font("VN", "B", 10)
+        pdf.set_fill_color(230, 230, 230)
+        pdf.cell(w[0], 8, "Khoản mục", border=1, align="C", fill=True)
+        pdf.cell(w[1], 8, "Chi tiết", border=1, align="C", fill=True)
+        pdf.cell(w[2], 8, "Thành tiền (đ)", border=1, align="C", fill=True,
+                 new_x="LMARGIN", new_y="NEXT")
+
+        dong = [
+            ("Tiền phòng", "", rec["gia_phong"]),
+            (
+                "Tiền điện",
+                f"{rec['dien_cu']} → {rec['dien_moi']} = {kq['so_dien']} kWh x {tien(prices['gia_dien'])}",
+                kq["tien_dien"],
+            ),
+            (
+                "Tiền nước",
+                f"{rec['nuoc_cu']} → {rec['nuoc_moi']} = {kq['so_nuoc']} m³ x {tien(prices['gia_nuoc'])}",
+                kq["tien_nuoc"],
+            ),
+            ("Phí khác", "Wifi, vệ sinh...", kq["phi_khac"]),
+        ]
+        pdf.set_font("VN", "", 9)
+        for ten, chi_tiet, so_tien in dong:
+            pdf.cell(w[0], 8, ten, border=1)
+            pdf.cell(w[1], 8, chi_tiet, border=1)
+            pdf.cell(w[2], 8, tien(so_tien), border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+
+        pdf.set_font("VN", "B", 11)
+        pdf.cell(w[0] + w[1], 9, "TỔNG CỘNG", border=1, align="C")
+        pdf.cell(w[2], 9, tien(kq["tong"]), border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(4)
+
+        pdf.set_font("VN", "B", 10)
+        pdf.cell(35, 6, "Trạng thái:")
+        pdf.set_font("VN", "", 10)
+        pdf.cell(0, 6, rec["trang_thai"], new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(4)
+
+        pdf.set_font("VN", "", 9)
+        pdf.cell(0, 5, f"Ngày lập: {datetime.now().strftime('%d/%m/%Y')}", align="R",
+                 new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+        # Chữ ký
+        pdf.set_font("VN", "B", 10)
+        pdf.cell(64, 6, "Chủ trọ", align="C")
+        pdf.cell(64, 6, "Người thuê", align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("VN", "", 8)
+        pdf.cell(64, 5, "(Ký, ghi rõ họ tên)", align="C")
+        pdf.cell(64, 5, "(Ký, ghi rõ họ tên)", align="C", new_x="LMARGIN", new_y="NEXT")
+
+    return bytes(pdf.output())
 
 
-def get_previous_readings(year, month, room_no):
-    if month == 1:
-        prev_month, prev_year = 12, year - 1
-    else:
-        prev_month, prev_year = month - 1, year
-    prev = load_bill(prev_year, prev_month, room_no)
-    if prev:
-        return int(prev["electric_new"]), int(prev["water_new"])
-    return 0, 0
-
-
-def money(value):
-    return f"{int(value):,}".replace(",", ".") + " VNĐ"
-
-
-def safe_filename(text):
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in text)
-
-
-def create_invoice_pdf(year, month, room_no, data, rates):
-    electric_rate, water_rate, other_fee = rates
-    electric_used = max(int(data["dien_moi"]) - int(data["dien_cu"]), 0)
-    water_used = max(int(data["nuoc_moi"]) - int(data["nuoc_cu"]), 0)
-    electric_cost = electric_used * electric_rate
-    water_cost = water_used * water_rate
-    total = int(data["gia_phong"]) + electric_cost + water_cost + other_fee
-
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        buffer, pagesize=A4,
-        rightMargin=18 * mm, leftMargin=18 * mm,
-        topMargin=16 * mm, bottomMargin=16 * mm
-    )
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "InvoiceTitle", parent=styles["Title"], alignment=TA_CENTER,
-        fontName=PDF_FONT_BOLD, fontSize=16, leading=21, spaceAfter=8
-    )
-    center_style = ParagraphStyle(
-        "CenterSmall", parent=styles["Normal"], alignment=TA_CENTER,
-        fontSize=10, leading=14
-    )
-    normal = ParagraphStyle(
-        "VietnameseText", parent=styles["Normal"],
-        fontName=PDF_FONT, fontSize=10, leading=14
-    )
-    story = [
-        Paragraph("PHIẾU THU TIỀN PHÒNG TRỌ", title_style),
-        Paragraph(f"Phòng {room_no} — Tháng {month}/{year}", center_style),
-        Spacer(1, 8 * mm),
-        Paragraph("<b>THÔNG TIN NGƯỜI Ở</b>", styles["Heading2"]),
-    ]
-
-    tenant_name = escape(str(data.get("ten_nguoi_o", "") or "Chưa cập nhật"))
-    phone = escape(str(data.get("so_dien_thoai", "") or "Chưa cập nhật"))
-    tenant_info = escape(str(data.get("thong_tin_nguoi_o", "") or ""))
-    story.append(Paragraph(f"Họ tên: {tenant_name}", normal))
-    story.append(Paragraph(f"Số điện thoại: {phone}", normal))
-    if tenant_info:
-        story.append(Paragraph(f"Thông tin thêm: {tenant_info}", normal))
-    story += [Spacer(1, 5 * mm), Paragraph("<b>CHI TIẾT CÁC KHOẢN THU</b>", styles["Heading2"])]
-
-    rows = [
-        ["Khoản thu", "Số lượng / chỉ số", "Đơn giá (VNĐ)", "Thành tiền (VNĐ)"],
-        ["Tiền phòng", "1 tháng", money(data["gia_phong"]), money(data["gia_phong"])],
-        ["Tiền điện", f'{data["dien_cu"]} → {data["dien_moi"]} ({electric_used} kWh)',
-         f"{electric_rate:,}".replace(",", "."), money(electric_cost)],
-        ["Tiền nước", f'{data["nuoc_cu"]} → {data["nuoc_moi"]} ({water_used} m³)',
-         f"{water_rate:,}".replace(",", "."), money(water_cost)],
-        ["Phí khác (wifi, vệ sinh...)", "1 tháng", money(other_fee), money(other_fee)],
-        ["TỔNG CỘNG", "", "", money(total)],
-    ]
-    table = Table(rows, colWidths=[43 * mm, 53 * mm, 37 * mm, 41 * mm], repeatRows=1)
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E78")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), PDF_FONT_BOLD),
-        ("FONTNAME", (0, 1), (-1, -1), PDF_FONT),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("LEADING", (0, 0), (-1, -1), 11),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 7),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#EAF2F8")),
-        ("FONTNAME", (0, -1), (-1, -1), PDF_FONT_BOLD),
-    ]))
-    story += [
-        table,
-        Spacer(1, 6 * mm),
-        Paragraph(f"<b>Trạng thái thanh toán:</b> {escape(str(data['ghi_chu']))}", normal),
-        Spacer(1, 18 * mm),
-    ]
-    sign_table = Table(
-        [["Người thuê", "Người thu tiền"], ["(Ký và ghi rõ họ tên)", "(Ký và ghi rõ họ tên)"]],
-        colWidths=[87 * mm, 87 * mm], rowHeights=[8 * mm, 8 * mm]
-    )
-    sign_table.setStyle(TableStyle([
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-    ]))
-    story.append(sign_table)
-    story.append(Spacer(1, 8 * mm))
-    story.append(Paragraph(
-        f"Ngày xuất phiếu: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-        ParagraphStyle("RightDate", parent=normal, alignment=TA_RIGHT, fontSize=8)
-    ))
-    doc.build(story)
-    buffer.seek(0)
-    return buffer.getvalue(), total, electric_used, water_used
-
-
+# ======================================
+# GIAO DIỆN
+# ======================================
 init_db()
 
-# ======================================
-# SIDEBAR - ĐƠN GIÁ & CẤU HÌNH
-# ======================================
-st.sidebar.header("⚙️ ĐƠN GIÁ ĐIỆN NƯỚC")
-gia_dien = st.sidebar.number_input("⚡ Giá điện (đ/kWh)", min_value=0, value=3500, step=100)
-gia_nuoc = st.sidebar.number_input("💧 Giá nước (đ/m³)", min_value=0, value=15000, step=500)
-phi_khac = st.sidebar.number_input("📦 Phí khác (wifi, vệ sinh...)", min_value=0, value=150000, step=10000)
-so_phong = st.sidebar.slider("Số lượng phòng", min_value=1, max_value=100, value=10, step=1)
+st.title(f"PHẦN MỀM QUẢN LÝ THU TIỀN {TEN_DAY_TRO}")
+
+# ---------- SIDEBAR ----------
+st.sidebar.header("Cấu hình")
+
+so_phong = st.sidebar.slider(
+    "Số lượng phòng",
+    min_value=1,
+    max_value=100,
+    value=get_setting("so_phong"),
+    step=1,
+)
+if so_phong != get_setting("so_phong"):
+    set_setting("so_phong", so_phong)
 
 col_nam, col_thang = st.sidebar.columns(2)
-now = datetime.now()
 with col_nam:
-    years = list(range(now.year - 1, now.year + 6))
-    nam_chon = st.selectbox("Chọn năm:", years, index=years.index(now.year))
+    nam_hien_tai = datetime.now().year
+    danh_sach_nam = list(range(nam_hien_tai - 1, nam_hien_tai + 6))
+    nam_chon = st.selectbox(
+        "Chọn năm:", danh_sach_nam, index=danh_sach_nam.index(nam_hien_tai)
+    )
 with col_thang:
     idx_thang_chon = st.selectbox(
-        "Chọn tháng:", list(range(1, 13)),
-        index=now.month - 1, format_func=lambda x: f"Tháng {x}"
+        "Chọn tháng:",
+        list(range(1, 13)),
+        index=datetime.now().month - 1,
+        format_func=lambda x: f"Tháng {x}",
     )
+
 thang_chon = f"Tháng {idx_thang_chon}/{nam_chon}"
 
-# ======================================
-# NHẬP / CẬP NHẬT PHÒNG
-# ======================================
-st.header(f"📋 Nhập số liệu - {thang_chon}")
+st.sidebar.header("Đơn giá điện nước")
+st.sidebar.caption(f"Đơn giá áp dụng riêng cho {thang_chon}")
+prices_db = get_month_prices(nam_chon, idx_thang_chon)
+suffix = f"{nam_chon}_{idx_thang_chon}"
+
+gia_dien = st.sidebar.number_input(
+    "Giá điện (đ/kWh)", min_value=0, value=int(prices_db["gia_dien"]), step=100,
+    key=f"gia_dien_{suffix}",
+)
+gia_nuoc = st.sidebar.number_input(
+    "Giá nước (đ/m³)", min_value=0, value=int(prices_db["gia_nuoc"]), step=500,
+    key=f"gia_nuoc_{suffix}",
+)
+phi_khac = st.sidebar.number_input(
+    "Phí khác (wifi, vệ sinh...)", min_value=0, value=int(prices_db["phi_khac"]), step=10000,
+    key=f"phi_khac_{suffix}",
+)
+prices = {"gia_dien": gia_dien, "gia_nuoc": gia_nuoc, "phi_khac": phi_khac}
+if prices != prices_db:
+    save_month_prices(nam_chon, idx_thang_chon, gia_dien, gia_nuoc, phi_khac)
+
+# Đảm bảo dữ liệu các phòng của tháng đang chọn đã tồn tại trong database
+ensure_records(nam_chon, idx_thang_chon, so_phong)
+
+# ---------- NHẬP DỮ LIỆU ----------
+st.header(f"Nhập số liệu - {thang_chon}")
+
 phong = st.selectbox(
     "Chọn phòng cần nhập dữ liệu:",
     range(1, so_phong + 1),
-    format_func=lambda x: f"Phòng {x}",
-    key=f"select_room_{nam_chon}_{idx_thang_chon}_{so_phong}"
+    key=f"selectbox_phong_{suffix}",
 )
 
-saved = load_bill(nam_chon, idx_thang_chon, phong)
-if saved:
-    data = {
-        "gia_phong": saved["room_price"],
-        "ten_nguoi_o": saved["tenant_name"],
-        "so_dien_thoai": saved["tenant_phone"],
-        "thong_tin_nguoi_o": saved["tenant_info"],
-        "dien_cu": saved["electric_old"],
-        "dien_moi": saved["electric_new"],
-        "nuoc_cu": saved["water_old"],
-        "nuoc_moi": saved["water_new"],
-        "ghi_chu": saved["note"],
-    }
-else:
-    dien_cu, nuoc_cu = get_previous_readings(nam_chon, idx_thang_chon, phong)
-    data = {
-        "gia_phong": 2500000,
-        "ten_nguoi_o": "",
-        "so_dien_thoai": "",
-        "thong_tin_nguoi_o": "",
-        "dien_cu": dien_cu,
-        "dien_moi": dien_cu,
-        "nuoc_cu": nuoc_cu,
-        "nuoc_moi": nuoc_cu,
-        "ghi_chu": "Chưa thanh toán",
-    }
+rec = get_record(nam_chon, idx_thang_chon, phong)
+st.subheader(f"Cập nhật: Phòng {phong} ({thang_chon})")
 
-st.subheader(f"🏠 Cập nhật: Phòng {phong} ({thang_chon})")
-with st.form(key=f"room_form_{nam_chon}_{idx_thang_chon}_{phong}"):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        gia_phong_input = st.number_input("Giá phòng (VNĐ)", min_value=0, value=int(data["gia_phong"]), step=50000)
-        ten_nguoi_o_input = st.text_input("Họ tên người ở", value=data["ten_nguoi_o"])
-        so_dien_thoai_input = st.text_input("Số điện thoại", value=data["so_dien_thoai"])
-        thong_tin_nguoi_o_input = st.text_area("Thông tin người ở thêm", value=data["thong_tin_nguoi_o"], placeholder="Ví dụ: số CCCD (nếu cần), số người ở, ghi chú...")
-    with c2:
-        dien_cu_input = st.number_input("Số điện CŨ (kWh)", min_value=0, value=int(data["dien_cu"]), step=1)
-        dien_moi_input = st.number_input("Số điện MỚI (kWh)", min_value=0, value=int(data["dien_moi"]), step=1)
-        nuoc_cu_input = st.number_input("Số nước CŨ (m³)", min_value=0, value=int(data["nuoc_cu"]), step=1)
-        nuoc_moi_input = st.number_input("Số nước MỚI (m³)", min_value=0, value=int(data["nuoc_moi"]), step=1)
-    with c3:
-        ghi_chu_input = st.selectbox(
-            "Trạng thái thanh toán",
-            ["Chưa thanh toán", "Đã thanh toán"],
-            index=0 if data["ghi_chu"] != "Đã thanh toán" else 1
+with st.form(key=f"form_{suffix}_{phong}"):
+    # Hàng 1: Giá phòng + thông tin người ở
+    a1, a2, a3, a4 = st.columns([1.2, 1.6, 1.2, 0.8])
+    with a1:
+        gia_phong = st.number_input(
+            "Giá phòng (VNĐ)", min_value=0, value=int(rec["gia_phong"]), step=50000
         )
-        st.caption(f"Giá điện: {gia_dien:,} VNĐ/kWh".replace(",", "."))
-        st.caption(f"Giá nước: {gia_nuoc:,} VNĐ/m³".replace(",", "."))
-        st.caption(f"Phí khác: {phi_khac:,} VNĐ/tháng".replace(",", "."))
-    submitted = st.form_submit_button("💾 Lưu thông tin phòng", type="primary", use_container_width=True)
+    with a2:
+        nguoi_o = st.text_input("Họ tên người ở", value=rec["nguoi_o"])
+    with a3:
+        sdt = st.text_input("Số điện thoại", value=rec["sdt"])
+    with a4:
+        so_nguoi = st.number_input(
+            "Số người ở", min_value=0, max_value=20, value=int(rec["so_nguoi"]), step=1
+        )
+
+    # Hàng 2: điện nước
+    b1, b2, b3, b4 = st.columns(4)
+    with b1:
+        dien_cu = st.number_input("Số điện CŨ", min_value=0, value=int(rec["dien_cu"]))
+    with b2:
+        dien_moi = st.number_input("Số điện MỚI", min_value=0, value=int(rec["dien_moi"]))
+    with b3:
+        nuoc_cu = st.number_input("Số nước CŨ", min_value=0, value=int(rec["nuoc_cu"]))
+    with b4:
+        nuoc_moi = st.number_input("Số nước MỚI", min_value=0, value=int(rec["nuoc_moi"]))
+
+    # Hàng 3: trạng thái thanh toán
+    trang_thai = st.radio(
+        "Trạng thái thanh toán",
+        TRANG_THAI,
+        index=TRANG_THAI.index(rec["trang_thai"]) if rec["trang_thai"] in TRANG_THAI else 0,
+        horizontal=True,
+    )
+
+    submitted = st.form_submit_button("Lưu thông tin phòng", type="primary")
 
 if submitted:
-    data = {
-        "gia_phong": gia_phong_input,
-        "ten_nguoi_o": ten_nguoi_o_input.strip(),
-        "so_dien_thoai": so_dien_thoai_input.strip(),
-        "thong_tin_nguoi_o": thong_tin_nguoi_o_input.strip(),
-        "dien_cu": dien_cu_input,
-        "dien_moi": dien_moi_input,
-        "nuoc_cu": nuoc_cu_input,
-        "nuoc_moi": nuoc_moi_input,
-        "ghi_chu": ghi_chu_input,
-    }
-    save_bill(nam_chon, idx_thang_chon, phong, data)
-    st.success(f"Đã lưu dữ liệu Phòng {phong} - {thang_chon} vào SQLite.")
-    st.rerun()
+    save_record(
+        nam_chon, idx_thang_chon, phong,
+        {
+            "gia_phong": gia_phong, "nguoi_o": nguoi_o.strip(), "sdt": sdt.strip(),
+            "so_nguoi": so_nguoi, "dien_cu": dien_cu, "dien_moi": dien_moi,
+            "nuoc_cu": nuoc_cu, "nuoc_moi": nuoc_moi, "trang_thai": trang_thai,
+        },
+    )
+    st.success(f"Đã lưu Phòng {phong} - {thang_chon}")
+    rec = get_record(nam_chon, idx_thang_chon, phong)
 
-# ======================================
-# BẢNG TỔNG HỢP
-# ======================================
+# Xuất PDF riêng cho phòng đang chọn
+try:
+    pdf_phong = tao_pdf(
+        nam_chon, idx_thang_chon, [(rec, tinh_tien(rec, prices), prices)]
+    )
+    st.download_button(
+        label=f"Xuất PDF Phòng {phong} - {thang_chon}",
+        data=pdf_phong,
+        file_name=f"Phieu_Phong_{phong}_{idx_thang_chon:02d}_{nam_chon}.pdf",
+        mime="application/pdf",
+        key=f"pdf_phong_{suffix}_{phong}",
+    )
+except FileNotFoundError as e:
+    st.warning(str(e))
+
+# ---------- BẢNG TỔNG HỢP ----------
 st.divider()
-st.header(f"📊 Bảng tổng hợp tiền trọ - {thang_chon}")
+st.header(f"Bảng tổng hợp tiền trọ - {thang_chon}")
+
+records = get_records(nam_chon, idx_thang_chon, so_phong)
 ket_qua = []
 tong_doanh_thu = 0
-for i in range(1, so_phong + 1):
-    saved = load_bill(nam_chon, idx_thang_chon, i)
-    if saved:
-        d = {
-            "gia_phong": saved["room_price"],
-            "dien_cu": saved["electric_old"],
-            "dien_moi": saved["electric_new"],
-            "nuoc_cu": saved["water_old"],
-            "nuoc_moi": saved["water_new"],
-            "ghi_chu": saved["note"],
-            "ten_nguoi_o": saved["tenant_name"],
-            "so_dien_thoai": saved["tenant_phone"],
-        }
-    else:
-        dien_cu, nuoc_cu = get_previous_readings(nam_chon, idx_thang_chon, i)
-        d = {
-            "gia_phong": 2500000, "dien_cu": dien_cu, "dien_moi": dien_cu,
-            "nuoc_cu": nuoc_cu, "nuoc_moi": nuoc_cu,
-            "ghi_chu": "Chưa thanh toán", "ten_nguoi_o": "", "so_dien_thoai": ""
-        }
-    so_dien = max(int(d["dien_moi"]) - int(d["dien_cu"]), 0)
-    so_nuoc = max(int(d["nuoc_moi"]) - int(d["nuoc_cu"]), 0)
-    tien_dien = so_dien * gia_dien
-    tien_nuoc = so_nuoc * gia_nuoc
-    tong_tien = int(d["gia_phong"]) + tien_dien + tien_nuoc + phi_khac
-    tong_doanh_thu += tong_tien
+da_thu = 0
+danh_sach_pdf = []
+
+for r in records:
+    kq = tinh_tien(r, prices)
+    tong_doanh_thu += kq["tong"]
+    if r["trang_thai"] == TRANG_THAI[1]:
+        da_thu += kq["tong"]
+    danh_sach_pdf.append((r, kq, prices))
     ket_qua.append({
-        "Phòng": f"Phòng {i}",
-        "Người ở": d["ten_nguoi_o"],
-        "Số điện cũ": d["dien_cu"],
-        "Số điện mới": d["dien_moi"],
-        "Tiền điện": tien_dien,
-        "Số nước cũ": d["nuoc_cu"],
-        "Số nước mới": d["nuoc_moi"],
-        "Tiền nước": tien_nuoc,
-        "Giá phòng": d["gia_phong"],
-        "Phí khác": phi_khac,
-        "Tổng tiền": tong_tien,
-        "Trạng thái": d["ghi_chu"],
+        "Phòng": f"Phòng {r['phong']}",
+        "Người ở": r["nguoi_o"],
+        "SĐT": r["sdt"],
+        "Giá phòng": r["gia_phong"],
+        "Số điện cũ": r["dien_cu"],
+        "Số điện mới": r["dien_moi"],
+        "Tiền điện": kq["tien_dien"],
+        "Số nước cũ": r["nuoc_cu"],
+        "Số nước mới": r["nuoc_moi"],
+        "Tiền nước": kq["tien_nuoc"],
+        "Phí khác": kq["phi_khac"],
+        "Tổng tiền": kq["tong"],
+        "Thanh toán": r["trang_thai"],
     })
 
-df = pd.DataFrame(ket_qua)
-st.dataframe(
-    df, use_container_width=True, hide_index=True,
-    column_config={
-        "Giá phòng": st.column_config.NumberColumn(format="%d"),
-        "Tiền điện": st.column_config.NumberColumn(format="%d"),
-        "Tiền nước": st.column_config.NumberColumn(format="%d"),
-        "Phí khác": st.column_config.NumberColumn(format="%d"),
-        "Tổng tiền": st.column_config.NumberColumn(format="%d"),
-    }
-)
-st.metric(f"💰 TỔNG THU TIỀN CÁC PHÒNG ({thang_chon})", money(tong_doanh_thu))
-csv = df.to_csv(index=False).encode("utf-8-sig")
-st.download_button(
-    label=f"📥 Xuất báo cáo {thang_chon} (CSV)",
-    data=csv,
-    file_name=f"Bang_Tien_Phong_Thang_{idx_thang_chon}_{nam_chon}.csv",
-    mime="text/csv"
-)
+if ket_qua:
+    df = pd.DataFrame(ket_qua)
 
-# ======================================
-# XUẤT HÓA ĐƠN PDF RIÊNG TỪNG PHÒNG
-# ======================================
-st.divider()
-st.header("🧾 Xuất phiếu thu PDF theo từng phòng")
-pdf_room = st.selectbox(
-    "Chọn phòng cần xuất PDF:",
-    range(1, so_phong + 1),
-    format_func=lambda x: f"Phòng {x}",
-    key=f"pdf_room_{nam_chon}_{idx_thang_chon}_{so_phong}"
-)
-pdf_saved = load_bill(nam_chon, idx_thang_chon, pdf_room)
-if pdf_saved:
-    pdf_data = {
-        "gia_phong": pdf_saved["room_price"],
-        "ten_nguoi_o": pdf_saved["tenant_name"],
-        "so_dien_thoai": pdf_saved["tenant_phone"],
-        "thong_tin_nguoi_o": pdf_saved["tenant_info"],
-        "dien_cu": pdf_saved["electric_old"],
-        "dien_moi": pdf_saved["electric_new"],
-        "nuoc_cu": pdf_saved["water_old"],
-        "nuoc_moi": pdf_saved["water_new"],
-        "ghi_chu": pdf_saved["note"],
-    }
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Giá phòng": st.column_config.NumberColumn(format="%d"),
+            "Tiền điện": st.column_config.NumberColumn(format="%d"),
+            "Tiền nước": st.column_config.NumberColumn(format="%d"),
+            "Phí khác": st.column_config.NumberColumn(format="%d"),
+            "Tổng tiền": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric(f"Tổng thu nhập các phòng ({thang_chon})", f"{tong_doanh_thu:,.0f} VNĐ")
+    m2.metric("Đã thu", f"{da_thu:,.0f} VNĐ")
+    m3.metric("Chưa thu", f"{tong_doanh_thu - da_thu:,.0f} VNĐ")
+
+    st.subheader("Xuất báo cáo")
+    e1, e2, e3 = st.columns(3)
+
+    with e1:
+        csv = df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            label=f"Xuất bảng tổng hợp {thang_chon} (CSV)",
+            data=csv,
+            file_name=f"Bang_Tien_Phong_{idx_thang_chon:02d}_{nam_chon}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with e2:
+        try:
+            pdf_all = tao_pdf(nam_chon, idx_thang_chon, danh_sach_pdf)
+            st.download_button(
+                label=f"Xuất PDF tất cả phòng {thang_chon}",
+                data=pdf_all,
+                file_name=f"Phieu_Tat_Ca_Phong_{idx_thang_chon:02d}_{nam_chon}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        except FileNotFoundError as e:
+            st.warning(str(e))
+
+    with e3:
+        if os.path.exists(DB_PATH):
+            with open(DB_PATH, "rb") as f:
+                st.download_button(
+                    label="Sao lưu database (.db)",
+                    data=f.read(),
+                    file_name=f"tien_tro_backup_{datetime.now().strftime('%Y%m%d')}.db",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
 else:
-    e_old, w_old = get_previous_readings(nam_chon, idx_thang_chon, pdf_room)
-    pdf_data = {
-        "gia_phong": 2500000, "ten_nguoi_o": "", "so_dien_thoai": "",
-        "thong_tin_nguoi_o": "", "dien_cu": e_old, "dien_moi": e_old,
-        "nuoc_cu": w_old, "nuoc_moi": w_old, "ghi_chu": "Chưa thanh toán"
-    }
-pdf_bytes, pdf_total, _, _ = create_invoice_pdf(
-    nam_chon, idx_thang_chon, pdf_room, pdf_data,
-    (gia_dien, gia_nuoc, phi_khac)
-)
-st.caption(f"Tổng tiền phiếu thu Phòng {pdf_room}: {money(pdf_total)}")
-st.download_button(
-    label=f"📄 Tải PDF tiền phòng {pdf_room} - {thang_chon}",
-    data=pdf_bytes,
-    file_name=f"Phieu_Thu_Phong_{pdf_room}_Thang_{idx_thang_chon}_{nam_chon}.pdf",
-    mime="application/pdf",
-    key=f"download_pdf_{nam_chon}_{idx_thang_chon}_{pdf_room}"
-)
-
-st.info(
-    "Lưu ý: SQLite lưu dữ liệu trong file quan_ly_tien_tro.db. "
-    "Nếu triển khai trên Streamlit Community Cloud, hệ thống tệp có thể bị đặt lại khi ứng dụng khởi động lại hoặc triển khai lại; "
-    "muốn dữ liệu bền vững lâu dài trên cloud, hãy dùng ổ lưu trữ bền vững hoặc cơ sở dữ liệu bên ngoài."
-)
+    st.info("Chưa có dữ liệu phòng nào cho tháng này.")
