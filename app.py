@@ -24,7 +24,7 @@ CAI_DAT_MAC_DINH = {
 }
 
 st.set_page_config(
-    page_title="Quản lý tiền phòng trọ",page_icon="💰"
+    page_title="Quản lý tiền phòng trọ", page_icon="💰",
     layout="wide",
 )
 
